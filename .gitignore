@@ -1,0 +1,32 @@
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Ignore actual training data, but keep folder structure
+dataset/**/*
+!dataset/**/
+!dataset/**/.gitkeep
+
+# Ignore trained model files, but keep folder
+models/*
+!models/.gitkeep
+
+# Ignore generated outputs, but keep folder
+outputs/*
+!outputs/.gitkeep
+
+# Common generated files
+*.pt
+*.pth
+*.csv
+EOF
