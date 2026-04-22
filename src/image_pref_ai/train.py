@@ -9,6 +9,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from .checkpoint_tester import test_checkpoints_and_select_best
 from .config import (
     CURRENT_TRAIN_DIR,
     DEFAULT_BATCH_SIZE,
@@ -61,6 +62,28 @@ def parse_args():
         "--fresh",
         action="store_true",
         help="Start from pretrained ResNet18 instead of loading saved model.",
+    )
+    parser.add_argument(
+        "--no_auto_test",
+        action="store_true",
+        help="Do not automatically test checkpoints after training.",
+    )
+    parser.add_argument(
+        "--selection_metric",
+        default="balanced_accuracy",
+        choices=[
+            "accuracy",
+            "balanced_accuracy",
+            "precision_for_1",
+            "recall_for_1",
+            "f1_for_1",
+        ],
+        help="Metric used to auto-select the best checkpoint after training.",
+    )
+    parser.add_argument(
+        "--detailed_test",
+        action="store_true",
+        help="Print detailed classification report for every checkpoint after training.",
     )
 
     return parser.parse_args()
@@ -252,6 +275,8 @@ def load_checkpoint_if_available(model, optimizer, model_path, device, fresh):
 def save_checkpoint(model, optimizer, epoch, best_val_acc, model_path):
     model_path.parent.mkdir(parents=True, exist_ok=True)
     LATEST_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir = model_path.parent / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "model_state_dict": model.state_dict(),
@@ -262,6 +287,9 @@ def save_checkpoint(model, optimizer, epoch, best_val_acc, model_path):
 
     torch.save(payload, model_path)
     torch.save(payload, LATEST_MODEL_PATH)
+    epoch_path = checkpoints_dir / f"epoch_{epoch:04d}.pt"
+    torch.save(payload, epoch_path)
+    print(f"Saved epoch checkpoint: {epoch_path}")
 
 
 def main():
@@ -391,8 +419,23 @@ def main():
         print("Confusion matrix:")
         print(confusion_matrix(final_targets, final_predictions))
 
+    print("\nTraining finished.")
+    print(f"Latest model saved at: {model_path}")
+
+    if not args.no_auto_test:
+        checkpoints_dir = model_path.parent / "checkpoints"
+        test_checkpoints_and_select_best(
+            test_dir=val_dir,
+            checkpoints_dir=checkpoints_dir,
+            target_model_path=model_path,
+            batch_size=args.batch_size,
+            selection_metric=args.selection_metric,
+            detailed=args.detailed_test,
+            select_best=True,
+        )
+
     print("\nDone.")
-    print(f"Model saved at: {model_path}")
+    print(f"Main model ready at: {model_path}")
 
 
 if __name__ == "__main__":
