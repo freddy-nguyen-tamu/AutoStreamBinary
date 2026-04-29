@@ -12,6 +12,7 @@ def list_images(folder: Path) -> list[Path]:
         return []
 
     paths: list[Path] = []
+
     for path in folder.rglob("*"):
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
             paths.append(path)
@@ -53,10 +54,11 @@ def build_transform(train: bool):
 
 
 def folder_samples(root: Path) -> list[tuple[Path, int]]:
-    samples: list[tuple[Path, int]] = []
+    samples = []
 
     for label in [0, 1]:
         class_dir = root / str(label)
+
         for image_path in list_images(class_dir):
             samples.append((image_path, label))
 
@@ -71,6 +73,54 @@ class ImagePreferenceDataset(Dataset):
         if not self.samples:
             raise RuntimeError(
                 f"No images found in {self.root}. "
+                "Expected folders named 0 and 1 containing images."
+            )
+
+        self.transform = build_transform(train=train)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        image_path, label = self.samples[index]
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load image: {image_path}") from exc
+
+        image = self.transform(image)
+        return image, label
+
+
+class MultiFolderPreferenceDataset(Dataset):
+    """
+    Loads images from multiple folder roots.
+
+    Example:
+        roots = [
+            dataset/current,
+            dataset/replay,
+        ]
+
+    Each root should contain:
+        0/
+        1/
+    """
+
+    def __init__(self, roots: list[Path], train: bool) -> None:
+        self.roots = [Path(root) for root in roots]
+        self.samples = []
+
+        for root in self.roots:
+            self.samples.extend(folder_samples(root))
+
+        self.samples = sorted(self.samples, key=lambda item: str(item[0]))
+
+        if not self.samples:
+            roots_text = ", ".join(str(root) for root in self.roots)
+            raise RuntimeError(
+                f"No images found in any training folder: {roots_text}. "
                 "Expected folders named 0 and 1 containing images."
             )
 

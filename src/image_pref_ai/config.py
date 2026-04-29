@@ -4,19 +4,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 DATASET_DIR = PROJECT_ROOT / "dataset"
 
-# Put the images for the current training run here:
-# dataset/current/0 = discard
-# dataset/current/1 = preferred
 CURRENT_TRAIN_DIR = DATASET_DIR / "current"
-
-# Optional validation folders:
-# dataset/val/0
-# dataset/val/1
+REPLAY_DIR = DATASET_DIR / "replay"
 VAL_DIR = DATASET_DIR / "val"
 
 MODELS_DIR = PROJECT_ROOT / "models"
 MODEL_PATH = MODELS_DIR / "image_preference_model.pt"
 LATEST_MODEL_PATH = MODELS_DIR / "image_preference_model.latest.pt"
+
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -25,10 +21,14 @@ DEFAULT_BATCH_SIZE = 32
 DEFAULT_EPOCHS = 5
 DEFAULT_LEARNING_RATE = 5e-5
 
-# These preserve old model behavior during incremental training.
 DEFAULT_DISTILL_WEIGHT = 0.5
 DEFAULT_WEIGHT_DRIFT_WEIGHT = 1e-4
 DEFAULT_DISTILL_TEMPERATURE = 2.0
+
+# Replay settings
+DEFAULT_REPLAY_FRACTION = 0.20
+DEFAULT_REPLAY_MAX_PER_CLASS = 500
+DEFAULT_REPLAY_SEED = 42
 
 NUM_WORKERS = 0
 

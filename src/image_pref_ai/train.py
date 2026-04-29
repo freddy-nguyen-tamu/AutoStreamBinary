@@ -1,5 +1,7 @@
 import argparse
 import copy
+import random
+import shutil
 from pathlib import Path
 
 import torch
@@ -9,7 +11,6 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .checkpoint_tester import test_checkpoints_and_select_best
 from .config import (
     CURRENT_TRAIN_DIR,
     DEFAULT_BATCH_SIZE,
@@ -17,13 +18,17 @@ from .config import (
     DEFAULT_DISTILL_WEIGHT,
     DEFAULT_EPOCHS,
     DEFAULT_LEARNING_RATE,
+    DEFAULT_REPLAY_FRACTION,
+    DEFAULT_REPLAY_MAX_PER_CLASS,
+    DEFAULT_REPLAY_SEED,
     DEFAULT_WEIGHT_DRIFT_WEIGHT,
     LATEST_MODEL_PATH,
     MODEL_PATH,
     NUM_WORKERS,
+    REPLAY_DIR,
     VAL_DIR,
 )
-from .data import ImagePreferenceDataset
+from .data import ImagePreferenceDataset, MultiFolderPreferenceDataset, list_images
 from .model import build_model, get_device
 
 
@@ -64,26 +69,32 @@ def parse_args():
         help="Start from pretrained ResNet18 instead of loading saved model.",
     )
     parser.add_argument(
-        "--no_auto_test",
-        action="store_true",
-        help="Do not automatically test checkpoints after training.",
+        "--replay_dir",
+        default=str(REPLAY_DIR),
+        help="Folder where replay images are stored.",
     )
     parser.add_argument(
-        "--selection_metric",
-        default="balanced_accuracy",
-        choices=[
-            "accuracy",
-            "balanced_accuracy",
-            "precision_for_1",
-            "recall_for_1",
-            "f1_for_1",
-        ],
-        help="Metric used to auto-select the best checkpoint after training.",
+        "--no_replay",
+        action="store_true",
+        help="Disable replay training and replay saving.",
     )
     parser.add_argument(
-        "--detailed_test",
-        action="store_true",
-        help="Print detailed classification report for every checkpoint after training.",
+        "--replay_fraction",
+        type=float,
+        default=DEFAULT_REPLAY_FRACTION,
+        help="Fraction of current images to copy into replay after training.",
+    )
+    parser.add_argument(
+        "--replay_max_per_class",
+        type=int,
+        default=DEFAULT_REPLAY_MAX_PER_CLASS,
+        help="Maximum replay images to keep per class.",
+    )
+    parser.add_argument(
+        "--replay_seed",
+        type=int,
+        default=DEFAULT_REPLAY_SEED,
+        help="Random seed for replay sampling.",
     )
 
     return parser.parse_args()
@@ -275,8 +286,6 @@ def load_checkpoint_if_available(model, optimizer, model_path, device, fresh):
 def save_checkpoint(model, optimizer, epoch, best_val_acc, model_path):
     model_path.parent.mkdir(parents=True, exist_ok=True)
     LATEST_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    checkpoints_dir = model_path.parent / "checkpoints"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "model_state_dict": model.state_dict(),
@@ -287,9 +296,96 @@ def save_checkpoint(model, optimizer, epoch, best_val_acc, model_path):
 
     torch.save(payload, model_path)
     torch.save(payload, LATEST_MODEL_PATH)
-    epoch_path = checkpoints_dir / f"epoch_{epoch:04d}.pt"
-    torch.save(payload, epoch_path)
-    print(f"Saved epoch checkpoint: {epoch_path}")
+
+
+def replay_filename(src_path: Path, label: int) -> str:
+    safe_stem = src_path.stem.replace(" ", "_")
+    suffix = src_path.suffix.lower()
+
+    unique_id = abs(hash(str(src_path.resolve()))) % 10_000_000_000
+
+    return f"class_{label}_{safe_stem}_{unique_id}{suffix}"
+
+
+def prune_replay_class_folder(class_dir: Path, max_items: int):
+    if max_items <= 0:
+        return
+
+    images = list_images(class_dir)
+
+    if len(images) <= max_items:
+        return
+
+    images_by_oldest = sorted(images, key=lambda path: path.stat().st_mtime)
+    extra_count = len(images_by_oldest) - max_items
+
+    for path in images_by_oldest[:extra_count]:
+        try:
+            path.unlink()
+            print(f"Removed old replay image: {path}")
+        except OSError as exc:
+            print(f"Could not remove replay image {path}: {exc}")
+
+
+def copy_current_images_to_replay(
+    current_dir: Path,
+    replay_dir: Path,
+    replay_fraction: float,
+    replay_max_per_class: int,
+    replay_seed: int,
+):
+    if replay_fraction <= 0:
+        print("Replay fraction is 0. Skipping replay update.")
+        return
+
+    rng = random.Random(replay_seed)
+
+    print("\n" + "=" * 80)
+    print("Updating replay buffer")
+    print("=" * 80)
+
+    for label in [0, 1]:
+        current_class_dir = current_dir / str(label)
+        replay_class_dir = replay_dir / str(label)
+        replay_class_dir.mkdir(parents=True, exist_ok=True)
+
+        current_images = list_images(current_class_dir)
+
+        if not current_images:
+            print(f"No current images for class {label}. Skipping.")
+            continue
+
+        sample_count = max(1, int(len(current_images) * replay_fraction))
+        sample_count = min(sample_count, len(current_images))
+
+        sampled_images = rng.sample(current_images, sample_count)
+
+        copied = 0
+
+        for src_path in sampled_images:
+            dst_name = replay_filename(src_path, label)
+            dst_path = replay_class_dir / dst_name
+
+            if dst_path.exists():
+                continue
+
+            try:
+                shutil.copy2(src_path, dst_path)
+                copied += 1
+            except OSError as exc:
+                print(f"Could not copy {src_path} to replay: {exc}")
+
+        prune_replay_class_folder(
+            class_dir=replay_class_dir,
+            max_items=replay_max_per_class,
+        )
+
+        final_count = len(list_images(replay_class_dir))
+
+        print(
+            f"Class {label}: copied {copied} image(s) into replay. "
+            f"Replay now has {final_count}/{replay_max_per_class} image(s)."
+        )
 
 
 def main():
@@ -301,7 +397,33 @@ def main():
 
     print(f"Training folder: {train_dir}")
 
-    train_dataset = ImagePreferenceDataset(train_dir, train=True)
+    replay_dir = Path(args.replay_dir)
+
+    if args.no_replay:
+        train_dataset = ImagePreferenceDataset(train_dir, train=True)
+        print("Replay training is disabled.")
+    else:
+        train_dataset = MultiFolderPreferenceDataset(
+            roots=[train_dir, replay_dir],
+            train=True,
+        )
+
+        current_count = 0
+        replay_count = 0
+
+        try:
+            current_count = len(ImagePreferenceDataset(train_dir, train=True))
+        except RuntimeError:
+            pass
+
+        try:
+            replay_count = len(ImagePreferenceDataset(replay_dir, train=True))
+        except RuntimeError:
+            pass
+
+        print("Replay training is enabled.")
+        print(f"Current images: {current_count}")
+        print(f"Replay images:  {replay_count}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -310,7 +432,7 @@ def main():
         num_workers=NUM_WORKERS,
     )
 
-    print(f"Training images this run: {len(train_dataset)}")
+    print(f"Total training images this run: {len(train_dataset)}")
 
     val_loader = None
 
@@ -419,23 +541,17 @@ def main():
         print("Confusion matrix:")
         print(confusion_matrix(final_targets, final_predictions))
 
-    print("\nTraining finished.")
-    print(f"Latest model saved at: {model_path}")
-
-    if not args.no_auto_test:
-        checkpoints_dir = model_path.parent / "checkpoints"
-        test_checkpoints_and_select_best(
-            test_dir=val_dir,
-            checkpoints_dir=checkpoints_dir,
-            target_model_path=model_path,
-            batch_size=args.batch_size,
-            selection_metric=args.selection_metric,
-            detailed=args.detailed_test,
-            select_best=True,
+    if not args.no_replay:
+        copy_current_images_to_replay(
+            current_dir=train_dir,
+            replay_dir=Path(args.replay_dir),
+            replay_fraction=args.replay_fraction,
+            replay_max_per_class=args.replay_max_per_class,
+            replay_seed=args.replay_seed,
         )
 
     print("\nDone.")
-    print(f"Main model ready at: {model_path}")
+    print(f"Model saved at: {model_path}")
 
 
 if __name__ == "__main__":
