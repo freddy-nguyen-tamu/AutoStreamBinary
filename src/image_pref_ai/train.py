@@ -13,6 +13,9 @@ from tqdm import tqdm
 
 from .config import (
     CURRENT_TRAIN_DIR,
+    DEFAULT_AUTO_VAL_FRACTION,
+    DEFAULT_AUTO_VAL_MAX_PER_CLASS,
+    DEFAULT_AUTO_VAL_SEED,
     DEFAULT_BATCH_SIZE,
     DEFAULT_DISTILL_TEMPERATURE,
     DEFAULT_DISTILL_WEIGHT,
@@ -95,6 +98,29 @@ def parse_args():
         type=int,
         default=DEFAULT_REPLAY_SEED,
         help="Random seed for replay sampling.",
+    )
+    parser.add_argument(
+        "--no_auto_val",
+        action="store_true",
+        help="Disable automatic creation of validation images from current images.",
+    )
+    parser.add_argument(
+        "--auto_val_fraction",
+        type=float,
+        default=DEFAULT_AUTO_VAL_FRACTION,
+        help="Fraction of current images to copy into validation if validation is empty.",
+    )
+    parser.add_argument(
+        "--auto_val_max_per_class",
+        type=int,
+        default=DEFAULT_AUTO_VAL_MAX_PER_CLASS,
+        help="Maximum validation images to auto-create per class.",
+    )
+    parser.add_argument(
+        "--auto_val_seed",
+        type=int,
+        default=DEFAULT_AUTO_VAL_SEED,
+        help="Random seed for automatic validation sampling.",
     )
 
     return parser.parse_args()
@@ -388,6 +414,77 @@ def copy_current_images_to_replay(
         )
 
 
+def val_filename(src_path: Path, label: int) -> str:
+    safe_stem = src_path.stem.replace(" ", "_")
+    suffix = src_path.suffix.lower()
+    unique_id = abs(hash(str(src_path.resolve()))) % 10_000_000_000
+
+    return f"class_{label}_{safe_stem}_{unique_id}{suffix}"
+
+
+def count_images_in_class_folder(folder: Path) -> int:
+    return len(list_images(folder))
+
+
+def auto_create_validation_from_current(
+    current_dir: Path,
+    val_dir: Path,
+    auto_val_fraction: float,
+    auto_val_max_per_class: int,
+    auto_val_seed: int,
+):
+    print("\n" + "=" * 80)
+    print("Checking automatic validation folders")
+    print("=" * 80)
+
+    rng = random.Random(auto_val_seed)
+
+    for label in [0, 1]:
+        current_class_dir = current_dir / str(label)
+        val_class_dir = val_dir / str(label)
+
+        val_class_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_val_count = count_images_in_class_folder(val_class_dir)
+
+        if existing_val_count > 0:
+            print(
+                f"dataset/val/{label} already has {existing_val_count} image(s). "
+                "Keeping existing validation set."
+            )
+            continue
+
+        current_images = list_images(current_class_dir)
+
+        if not current_images:
+            print(f"No current images for class {label}. Cannot create validation set.")
+            continue
+
+        sample_count = max(1, int(len(current_images) * auto_val_fraction))
+        sample_count = min(sample_count, auto_val_max_per_class, len(current_images))
+
+        sampled_images = rng.sample(current_images, sample_count)
+
+        copied = 0
+
+        for src_path in sampled_images:
+            dst_path = val_class_dir / val_filename(src_path, label)
+
+            if dst_path.exists():
+                continue
+
+            try:
+                shutil.copy2(src_path, dst_path)
+                copied += 1
+            except OSError as exc:
+                print(f"Could not copy validation image {src_path}: {exc}")
+
+        print(
+            f"Created dataset/val/{label} with {copied} image(s) "
+            f"copied from dataset/current/{label}."
+        )
+
+
 def main():
     args = parse_args()
 
@@ -396,6 +493,15 @@ def main():
     model_path = Path(args.model)
 
     print(f"Training folder: {train_dir}")
+
+    if not args.no_auto_val:
+        auto_create_validation_from_current(
+            current_dir=train_dir,
+            val_dir=val_dir,
+            auto_val_fraction=args.auto_val_fraction,
+            auto_val_max_per_class=args.auto_val_max_per_class,
+            auto_val_seed=args.auto_val_seed,
+        )
 
     replay_dir = Path(args.replay_dir)
 
