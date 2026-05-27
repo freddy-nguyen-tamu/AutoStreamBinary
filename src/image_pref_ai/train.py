@@ -7,23 +7,36 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from .checkpoint_tester import test_checkpoints_and_select_best
 from .config import (
     CURRENT_TRAIN_DIR,
+    DEFAULT_AUTO_TEST_ENABLED,
     DEFAULT_AUTO_VAL_FRACTION,
     DEFAULT_AUTO_VAL_MAX_PER_CLASS,
     DEFAULT_AUTO_VAL_SEED,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_DETAILED_TEST,
     DEFAULT_DISTILL_TEMPERATURE,
     DEFAULT_DISTILL_WEIGHT,
+    DEFAULT_EARLY_STOPPING_ENABLED,
+    DEFAULT_EARLY_STOPPING_METRIC,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
     DEFAULT_EPOCHS,
     DEFAULT_LEARNING_RATE,
+    DEFAULT_MIN_DELTA,
     DEFAULT_REPLAY_FRACTION,
     DEFAULT_REPLAY_MAX_PER_CLASS,
     DEFAULT_REPLAY_SEED,
+    DEFAULT_SELECTION_METRIC,
     DEFAULT_WEIGHT_DRIFT_WEIGHT,
     LATEST_MODEL_PATH,
     MODEL_PATH,
@@ -121,6 +134,56 @@ def parse_args():
         type=int,
         default=DEFAULT_AUTO_VAL_SEED,
         help="Random seed for automatic validation sampling.",
+    )
+    parser.add_argument(
+        "--no_early_stopping",
+        action="store_true",
+        help="Disable early stopping. By default, early stopping is enabled.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=DEFAULT_EARLY_STOPPING_PATIENCE,
+        help="Number of non-improving epochs allowed before stopping.",
+    )
+    parser.add_argument(
+        "--min_delta",
+        type=float,
+        default=DEFAULT_MIN_DELTA,
+        help="Minimum improvement required to count as a better epoch.",
+    )
+    parser.add_argument(
+        "--early_stopping_metric",
+        default=DEFAULT_EARLY_STOPPING_METRIC,
+        choices=[
+            "accuracy",
+            "balanced_accuracy",
+            "loss",
+        ],
+        help="Validation metric used for early stopping.",
+    )
+    parser.add_argument(
+        "--no_auto_test",
+        action="store_true",
+        help="Disable automatic checkpoint testing and best epoch selection.",
+    )
+    parser.add_argument(
+        "--selection_metric",
+        default=DEFAULT_SELECTION_METRIC,
+        choices=[
+            "accuracy",
+            "balanced_accuracy",
+            "precision_for_1",
+            "recall_for_1",
+            "f1_for_1",
+        ],
+        help="Metric used to auto-select the best checkpoint after training.",
+    )
+    parser.add_argument(
+        "--detailed_test",
+        action="store_true",
+        default=DEFAULT_DETAILED_TEST,
+        help="Print detailed classification report for every checkpoint after training.",
     )
 
     return parser.parse_args()
@@ -275,8 +338,15 @@ def evaluate(model, dataloader, criterion, device):
 
     avg_loss = total_loss / len(dataloader.dataset)
     accuracy = accuracy_score(targets, predictions)
+    balanced_accuracy = balanced_accuracy_score(targets, predictions)
 
-    return avg_loss, accuracy, targets, predictions
+    return {
+        "loss": avg_loss,
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_accuracy,
+        "targets": targets,
+        "predictions": predictions,
+    }
 
 
 def load_checkpoint_if_available(model, optimizer, model_path, device, fresh):
@@ -312,6 +382,8 @@ def load_checkpoint_if_available(model, optimizer, model_path, device, fresh):
 def save_checkpoint(model, optimizer, epoch, best_val_acc, model_path):
     model_path.parent.mkdir(parents=True, exist_ok=True)
     LATEST_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir = model_path.parent / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "model_state_dict": model.state_dict(),
@@ -322,6 +394,10 @@ def save_checkpoint(model, optimizer, epoch, best_val_acc, model_path):
 
     torch.save(payload, model_path)
     torch.save(payload, LATEST_MODEL_PATH)
+
+    epoch_path = checkpoints_dir / f"epoch_{epoch:04d}.pt"
+    torch.save(payload, epoch_path)
+    print(f"Saved epoch checkpoint: {epoch_path}")
 
 
 def replay_filename(src_path: Path, label: int) -> str:
@@ -485,6 +561,16 @@ def auto_create_validation_from_current(
         )
 
 
+def is_better_score(current_score, best_score, metric_name, min_delta):
+    if best_score is None:
+        return True
+
+    if metric_name == "loss":
+        return current_score < best_score - min_delta
+
+    return current_score > best_score + min_delta
+
+
 def main():
     args = parse_args()
 
@@ -584,6 +670,21 @@ def main():
 
     final_targets = []
     final_predictions = []
+    early_best_score = None
+    early_bad_epochs = 0
+    early_stopping_enabled = (
+        DEFAULT_EARLY_STOPPING_ENABLED and not args.no_early_stopping
+    )
+
+    if early_stopping_enabled:
+        print(
+            "Early stopping is enabled: "
+            f"metric={args.early_stopping_metric}, "
+            f"patience={args.patience}, "
+            f"min_delta={args.min_delta}"
+        )
+    else:
+        print("Early stopping is disabled.")
 
     for local_epoch in range(1, args.epochs + 1):
         global_epoch = previous_epoch + local_epoch
@@ -613,22 +714,52 @@ def main():
             f"drift: {metrics['drift_loss']:.6f}"
         )
 
+        should_stop = False
+
         if val_loader is not None:
-            val_loss, val_acc, targets, predictions = evaluate(
+            val_metrics = evaluate(
                 model=model,
                 dataloader=val_loader,
                 criterion=criterion,
                 device=device,
             )
 
-            final_targets = targets
-            final_predictions = predictions
+            final_targets = val_metrics["targets"]
+            final_predictions = val_metrics["predictions"]
 
-            print(f"Val loss:   {val_loss:.4f} | Val acc:   {val_acc:.4f}")
+            print(
+                f"Val loss:   {val_metrics['loss']:.4f} | "
+                f"Val acc:   {val_metrics['accuracy']:.4f} | "
+                f"Val balanced acc: {val_metrics['balanced_accuracy']:.4f}"
+            )
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            if val_metrics["accuracy"] > best_val_acc:
+                best_val_acc = val_metrics["accuracy"]
                 print("New best validation accuracy.")
+
+            early_score = val_metrics[args.early_stopping_metric]
+            if is_better_score(
+                current_score=early_score,
+                best_score=early_best_score,
+                metric_name=args.early_stopping_metric,
+                min_delta=args.min_delta,
+            ):
+                early_best_score = early_score
+                early_bad_epochs = 0
+                print(
+                    f"New best early-stopping score: "
+                    f"{args.early_stopping_metric}={early_score:.4f}"
+                )
+            else:
+                early_bad_epochs += 1
+                print(
+                    f"No early-stopping improvement "
+                    f"({early_bad_epochs}/{args.patience})."
+                )
+
+            if early_stopping_enabled and early_bad_epochs >= args.patience:
+                print("Early stopping triggered.")
+                should_stop = True
 
         save_checkpoint(
             model=model,
@@ -640,12 +771,27 @@ def main():
 
         print(f"Saved model checkpoint: {model_path}")
 
+        if should_stop:
+            break
+
     if val_loader is not None and final_targets and final_predictions:
         print("\nFinal validation report:")
         print(classification_report(final_targets, final_predictions, target_names=["0", "1"]))
 
         print("Confusion matrix:")
         print(confusion_matrix(final_targets, final_predictions))
+
+    if DEFAULT_AUTO_TEST_ENABLED and not args.no_auto_test:
+        checkpoints_dir = model_path.parent / "checkpoints"
+        test_checkpoints_and_select_best(
+            test_dir=val_dir,
+            checkpoints_dir=checkpoints_dir,
+            target_model_path=model_path,
+            batch_size=args.batch_size,
+            selection_metric=args.selection_metric,
+            detailed=args.detailed_test,
+            select_best=True,
+        )
 
     if not args.no_replay:
         copy_current_images_to_replay(

@@ -12,6 +12,14 @@ It supports incremental training with two old-memory retention methods:
 - teacher distillation from the previous saved model
 - an automatic replay buffer from older examples
 
+The default daily command is:
+
+```bash
+python train.py
+```
+
+By default, that runs up to 30 epochs, creates validation images if needed, uses replay, saves every epoch checkpoint, early-stops on balanced accuracy, auto-tests checkpoints, and selects the best checkpoint as the main model.
+
 ## Folder Layout
 
 ```text
@@ -29,6 +37,8 @@ dataset/
 models/
   image_preference_model.pt
   image_preference_model.latest.pt
+  checkpoints/
+    epoch_XXXX.pt
 
 outputs/
   optional CSV outputs
@@ -71,13 +81,16 @@ Then run:
 python train.py
 ```
 
-By default, training uses:
+By default, training:
 
-```text
-dataset/current + dataset/replay
-```
-
-After training finishes, it copies a random sample of the current images into `dataset/replay` for future runs.
+- creates `dataset/val/0` and `dataset/val/1` from `dataset/current` if validation is empty
+- trains on `dataset/current + dataset/replay`
+- validates after every epoch
+- saves every epoch to `models/checkpoints/epoch_XXXX.pt`
+- early-stops on `balanced_accuracy` with patience `3`
+- tests all checkpoints after training
+- copies the best checkpoint by `balanced_accuracy` to `models/image_preference_model.pt`
+- copies a random sample of current images into `dataset/replay` for future runs
 
 Default replay behavior:
 
@@ -97,6 +110,24 @@ Train without replay:
 
 ```bash
 python train.py --no_replay
+```
+
+Disable early stopping:
+
+```bash
+python train.py --no_early_stopping
+```
+
+Disable checkpoint auto-testing and best-epoch selection:
+
+```bash
+python train.py --no_auto_test
+```
+
+Train fewer epochs manually:
+
+```bash
+python train.py --epochs 5
 ```
 
 Copy more current images into replay after training:
@@ -125,16 +156,16 @@ python train.py --replay_fraction 0.2 --replay_max_per_class 500
 
 ## Validation
 
-Validation images are optional.
+Validation images are created automatically from `dataset/current` if `dataset/val/0` or `dataset/val/1` is empty.
 
-If present, put them in:
+You can also put validation images there yourself:
 
 ```text
 dataset/val/0
 dataset/val/1
 ```
 
-Training prints validation loss, validation accuracy, a final classification report, and a confusion matrix.
+Training prints validation loss, validation accuracy, balanced accuracy, a final classification report, and a confusion matrix.
 
 If validation folders have no supported images, training continues without validation.
 
@@ -145,9 +176,10 @@ Training saves:
 ```text
 models/image_preference_model.pt
 models/image_preference_model.latest.pt
+models/checkpoints/epoch_XXXX.pt
 ```
 
-The main model file is overwritten after each epoch.
+The main model file is overwritten during training, then automatic checkpoint testing copies the best checkpoint back to `models/image_preference_model.pt`.
 
 ## Predict One Image
 
@@ -236,7 +268,7 @@ Defaults are defined in `src/image_pref_ai/config.py`:
 ```text
 image size:              224
 batch size:              32
-epochs:                  5
+epochs:                  30
 learning rate:           5e-5
 distill weight:          0.5
 weight drift weight:     1e-4
@@ -244,4 +276,13 @@ distill temperature:     2.0
 replay fraction:         0.20
 replay max per class:    500
 replay seed:             42
+auto val fraction:       0.20
+auto val max per class:  200
+auto val seed:           123
+early stopping:          enabled
+early stopping metric:   balanced_accuracy
+early stopping patience: 3
+min delta:               0.0001
+auto checkpoint testing: enabled
+selection metric:        balanced_accuracy
 ```
